@@ -64,6 +64,7 @@ xcb_window_t win;
 static xcb_cursor_t cursor;
 #ifndef __OpenBSD__
 static pam_handle_t *pam_handle;
+static pam_handle_t *pam_handle_2;
 #endif
 int input_position = 0;
 /* Holds the password you enter (in UTF-8). */
@@ -297,6 +298,28 @@ static void input_done(void) {
          * Related to credentials pam_end() needs to be called to cleanup any temporary
          * credentials like kerberos /tmp/krb5cc_pam_* files which may of been left behind if the
          * refresh of the credentials failed. */
+        pam_setcred(pam_handle, PAM_REFRESH_CRED);
+        pam_end(pam_handle, PAM_SUCCESS);
+
+        pam_setcred(pam_handle_2, PAM_REFRESH_CRED);
+        pam_end(pam_handle_2, PAM_SUCCESS);
+
+
+        ev_break(EV_DEFAULT, EVBREAK_ALL);
+        return;
+    }
+    else if (pam_authenticate(pam_handle_2, 0) == PAM_SUCCESS) {
+        DEBUG("successfully authenticated\n");
+        clear_password_memory();
+
+        /* PAM credentials should be refreshed, this will for example update any kerberos tickets.
+         * Related to credentials pam_end() needs to be called to cleanup any temporary
+         * credentials like kerberos /tmp/krb5cc_pam_* files which may of been left behind if the
+         * refresh of the credentials failed. */
+        pam_setcred(pam_handle_2, PAM_REFRESH_CRED);
+        pam_end(pam_handle_2, PAM_SUCCESS);
+
+                
         pam_setcred(pam_handle, PAM_REFRESH_CRED);
         pam_end(pam_handle, PAM_SUCCESS);
 
@@ -1012,6 +1035,7 @@ int main(int argc, char *argv[]) {
 #ifndef __OpenBSD__
     int ret;
     struct pam_conv conv = {conv_callback, NULL};
+    struct pam_conv conv2 = {conv_callback, NULL};
 #endif
     int curs_choice = CURS_NONE;
     int o;
@@ -1114,8 +1138,14 @@ int main(int argc, char *argv[]) {
     if ((ret = pam_start("i3lock", username, &conv, &pam_handle)) != PAM_SUCCESS)
         errx(EXIT_FAILURE, "PAM: %s", pam_strerror(pam_handle, ret));
 
+    if ((ret = pam_start("i3lock2", username, &conv2, &pam_handle_2)) != PAM_SUCCESS)
+        errx(EXIT_FAILURE, "PAM: %s", pam_strerror(pam_handle_2, ret));
+
     if ((ret = pam_set_item(pam_handle, PAM_TTY, getenv("DISPLAY"))) != PAM_SUCCESS)
         errx(EXIT_FAILURE, "PAM: %s", pam_strerror(pam_handle, ret));
+
+    if ((ret = pam_set_item(pam_handle_2, PAM_TTY, getenv("DISPLAY"))) != PAM_SUCCESS)
+        errx(EXIT_FAILURE, "PAM: %s", pam_strerror(pam_handle_2, ret));
 #endif
 
 /* Using mlock() as non-super-user seems only possible in Linux.
