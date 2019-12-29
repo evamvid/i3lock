@@ -11,6 +11,10 @@
 #include <xcb/xcb_image.h>
 #include <xcb/xcb_atom.h>
 #include <xcb/xcb_aux.h>
+#include <xcb/composite.h>
+#include <xcb/xkb.h>
+#include <xkbcommon/xkbcommon.h>
+#include <xkbcommon/xkbcommon-x11.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -22,9 +26,13 @@
 #include <sys/time.h>
 
 #include "cursors.h"
+#include "i3lock.h"
+#include "xcb.h"
 #include "unlock_indicator.h"
 
 extern auth_state_t auth_state;
+extern bool composite;
+extern bool debug_mode;
 
 xcb_connection_t *conn;
 xcb_screen_t *screen;
@@ -107,6 +115,31 @@ xcb_window_t open_fullscreen_window(xcb_connection_t *conn, xcb_screen_t *scr, c
     uint32_t mask = 0;
     uint32_t values[3];
     xcb_window_t win = xcb_generate_id(conn);
+    xcb_window_t parent_win = scr->root;
+
+    if (composite) {
+        /* Check whether the composite extension is available */
+        const xcb_query_extension_reply_t *extension_query = NULL;
+        xcb_generic_error_t *error = NULL;
+        xcb_composite_get_overlay_window_cookie_t cookie;
+        xcb_composite_get_overlay_window_reply_t *composite_reply = NULL;
+
+        extension_query = xcb_get_extension_data(conn, &xcb_composite_id);
+        if (extension_query && extension_query->present) {
+            /* When composition is used, we need to use the composite overlay
+             * window instead of the normal root window to be able to cover
+             * composited windows */
+            cookie = xcb_composite_get_overlay_window(conn, scr->root);
+            composite_reply = xcb_composite_get_overlay_window_reply(conn, cookie, &error);
+
+            if (!error && composite_reply) {
+                parent_win = composite_reply->overlay_win;
+            }
+
+            free(composite_reply);
+            free(error);
+        }
+    }
 
     if (pixmap == XCB_NONE) {
         mask |= XCB_CW_BACK_PIXEL;
@@ -128,8 +161,8 @@ xcb_window_t open_fullscreen_window(xcb_connection_t *conn, xcb_screen_t *scr, c
 
     xcb_create_window(conn,
                       XCB_COPY_FROM_PARENT,
-                      win,       /* the window id */
-                      scr->root, /* parent == root */
+                      win, /* the window id */
+                      parent_win,
                       0, 0,
                       scr->width_in_pixels,
                       scr->height_in_pixels, /* dimensions */
@@ -400,4 +433,116 @@ void set_focused_window(xcb_connection_t *conn, const xcb_window_t root, const x
 
     xcb_send_event(conn, false, root, XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT, (char *)&ev);
     xcb_flush(conn);
+}
+
+xcb_pixmap_t capture_bg_pixmap(xcb_connection_t *conn, xcb_screen_t *scr, u_int32_t * resolution) {
+    xcb_pixmap_t bg_pixmap = xcb_generate_id(conn);
+    xcb_create_pixmap(conn, scr->root_depth, bg_pixmap, scr->root, resolution[0], resolution[1]);
+    xcb_gcontext_t gc = xcb_generate_id(conn);
+    uint32_t values[] = { scr->black_pixel, 1};
+    xcb_create_gc(conn, gc, bg_pixmap, XCB_GC_FOREGROUND | XCB_GC_SUBWINDOW_MODE, values);
+    xcb_rectangle_t rect = { 0, 0, resolution[0], resolution[1] };
+    xcb_poly_fill_rectangle(conn, bg_pixmap, gc, 1, &rect);
+    xcb_copy_area(conn, scr->root, bg_pixmap, gc, 0, 0, 0, 0, resolution[0], resolution[1]);
+    xcb_flush(conn);
+    xcb_free_gc(conn, gc);
+    return bg_pixmap;
+}
+
+static char * get_atom_name(xcb_connection_t* conn, xcb_atom_t atom) {
+    xcb_get_atom_name_reply_t *reply = NULL;
+    char *name;
+    int length;
+    char* answer = NULL;
+
+    if (atom == 0)
+        return "<empty>";
+
+		xcb_get_atom_name_cookie_t cookie;
+		xcb_generic_error_t *error = NULL;
+
+		cookie = xcb_get_atom_name(conn, atom);
+
+		reply = xcb_get_atom_name_reply(conn, cookie, &error);
+		if (!reply || error)
+				return "<invalid>";
+
+    length = xcb_get_atom_name_name_length(reply);
+    name = xcb_get_atom_name_name(reply);
+
+    answer = malloc(sizeof(char) * (length + 1));
+    strncpy(answer, name, length);
+    answer[length] = '\0';
+    free(error);
+    free(reply);
+    return answer;
+}
+
+
+char* xcb_get_key_group_names(xcb_connection_t *conn) {
+    uint8_t xkb_base_event;
+    uint8_t xkb_base_error;
+    if (xkb_x11_setup_xkb_extension(conn,
+                                    XKB_X11_MIN_MAJOR_XKB_VERSION,
+                                    XKB_X11_MIN_MINOR_XKB_VERSION,
+                                    0,
+                                    NULL,
+                                    NULL,
+                                    &xkb_base_event,
+                                    &xkb_base_error) != 1)
+    errx(EXIT_FAILURE, "Could not setup XKB extension.");
+
+
+    xcb_xkb_get_names_reply_t *reply = NULL;
+
+
+    xcb_generic_error_t *error = NULL;
+    xcb_xkb_get_names_cookie_t cookie;
+
+    cookie = xcb_xkb_get_names(conn,
+                                 XCB_XKB_ID_USE_CORE_KBD,
+                                 all_name_details);
+
+    reply = xcb_xkb_get_names_reply(conn, cookie, &error);
+    if (!reply || error)
+            errx(1, "couldn't get reply for get_names");
+
+    xcb_xkb_get_names_value_list_t list;
+
+    void *buffer;
+
+    buffer = xcb_xkb_get_names_value_list(reply);
+    xcb_xkb_get_names_value_list_unpack(buffer,
+                                        reply->nTypes,
+                                        reply->indicators,
+                                        reply->virtualMods,
+                                        reply->groupNames,
+                                        reply->nKeys,
+                                        reply->nKeyAliases,
+                                        reply->nRadioGroups,
+                                        reply->which,
+                                        &list);
+
+    /* dump group names. */
+
+    int length;
+    xcb_atom_t *iter;
+    char* answer = NULL;
+    length = xcb_xkb_get_names_value_list_groups_length(reply, &list);
+    iter = xcb_xkb_get_names_value_list_groups(&list);
+
+    for (int i = 0; i < length; i++) {
+            xcb_atom_t group_name = *iter;
+            char* name = get_atom_name(conn, group_name);
+            DEBUG("group_name %d: %s\n", i, name);
+            if (i == 0) {
+                answer = name;
+            } else {
+                free(name);
+            }
+            iter++;
+    }
+    free(reply);
+    free(error);
+    return answer;
 }

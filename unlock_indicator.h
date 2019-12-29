@@ -1,6 +1,11 @@
 #ifndef _UNLOCK_INDICATOR_H
 #define _UNLOCK_INDICATOR_H
 
+#include <ev.h>
+#include <xcb/xcb.h>
+
+#include "fonts.h"
+
 typedef enum {
     STATE_STARTED = 0,           /* default state */
     STATE_KEY_PRESSED = 1,       /* key was pressed, show unlock indicator */
@@ -19,8 +24,25 @@ typedef enum {
     STATE_I3LOCK_LOCK_FAILED = 4, /* i3lock failed to load */
 } auth_state_t;
 
+typedef struct {
+    text_t status_text;
+    text_t mod_text;
+    text_t keylayout_text;
+    text_t time_text;
+    text_t date_text;
+    text_t greeter_text;
+
+    double indicator_x, indicator_y;
+
+    double bar_x, bar_y;
+    double bar_offset;
+} DrawData;
+
 xcb_pixmap_t draw_image(uint32_t* resolution);
+void init_colors_once(void);
 void redraw_screen(void);
 void clear_indicator(void);
-
+void start_time_redraw_timeout(void);
+void* start_time_redraw_tick_pthread(void* arg);
+void start_time_redraw_tick(struct ev_loop* main_loop);
 #endif

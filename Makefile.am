@@ -22,6 +22,8 @@ i3lock_CFLAGS = \
 	$(XCB_UTIL_XRM_CFLAGS) \
 	$(XKBCOMMON_CFLAGS) \
 	$(CAIRO_CFLAGS) \
+	$(FONTCONFIG_CFLAGS) \
+	$(JPEG_CFLAGS) \
 	$(CODE_COVERAGE_CFLAGS)
 
 i3lock_CPPFLAGS = \
@@ -35,6 +37,8 @@ i3lock_LDADD = \
 	$(XCB_UTIL_XRM_LIBS) \
 	$(XKBCOMMON_LIBS) \
 	$(CAIRO_LIBS) \
+	$(JPEG_LIBS) \
+	$(FONTCONFIG_LIBS) \
 	$(CODE_COVERAGE_LDFLAGS)
 
 i3lock_SOURCES = \
@@ -48,7 +52,16 @@ i3lock_SOURCES = \
 	unlock_indicator.c \
 	unlock_indicator.h \
 	xcb.c \
-	xcb.h
+	xcb.h \
+	tinyexpr.c \
+	tinyexpr.h \
+	blur_simd.c \
+	blur.c \
+	blur.h \
+	jpg.c \
+	jpg.h \
+	fonts.h
+
 
 EXTRA_DIST = \
 	$(pamd_files) \

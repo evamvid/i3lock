@@ -2,22 +2,29 @@
  * vim:ts=4:sw=4:expandtab
  *
  * © 2010 Michael Stapelberg
+ * © 2015 Cassandra Fox
  *
  * See LICENSE for licensing information
  *
  */
 #include <config.h>
 
+#include <pthread.h>
+#include <math.h>
+
 #include <stdio.h>
+#include <locale.h>
 #include <stdlib.h>
 #include <pwd.h>
 #include <sys/types.h>
 #include <string.h>
+#include <dirent.h>
 #include <unistd.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <xcb/xcb.h>
 #include <xcb/xkb.h>
+#include <xcb/xproto.h>
 #include <err.h>
 #include <errno.h>
 #include <assert.h>
@@ -31,7 +38,9 @@
 #include <ev.h>
 #include <sys/mman.h>
 #include <xkbcommon/xkbcommon.h>
+#if XKBCOMPOSE == 1
 #include <xkbcommon/xkbcommon-compose.h>
+#endif
 #include <xkbcommon/xkbcommon-x11.h>
 #include <cairo.h>
 #include <cairo/cairo-xcb.h>
@@ -47,6 +56,9 @@
 #include "unlock_indicator.h"
 #include "randr.h"
 #include "dpi.h"
+#include "blur.h"
+#include "jpg.h"
+#include "fonts.h"
 
 #define TSTAMP_N_SECS(n) (n * 1.0)
 #define TSTAMP_N_MINS(n) (60 * TSTAMP_N_SECS(n))
@@ -59,6 +71,117 @@ typedef void (*ev_callback_t)(EV_P_ ev_timer *w, int revents);
 static void input_done(void);
 
 char color[7] = "ffffff";
+
+/* options for unlock indicator colors */
+char insidevercolor[9] = "006effbf";
+char insidewrongcolor[9] = "fa0000bf";
+char insidecolor[9] = "000000bf";
+char ringvercolor[9] = "3300faff";
+char ringwrongcolor[9] = "7d3300ff";
+char ringcolor[9] = "337d00ff";
+char linecolor[9] = "000000ff";
+char verifcolor[9] = "000000ff";
+char wrongcolor[9] = "000000ff";
+char layoutcolor[9] = "000000ff";
+char timecolor[9] = "000000ff";
+char datecolor[9] = "000000ff";
+char keyhlcolor[9] = "33db00ff";
+char bshlcolor[9] = "db3300ff";
+char separatorcolor[9] = "000000ff";
+char greetercolor[9] = "000000ff";
+
+/* int defining which display the lock indicator should be shown on. If -1, then show on all displays.*/
+int screen_number = 0;
+/* default is to use the supplied line color, 1 will be ring color, 2 will be to use the inside color for ver/wrong/etc */
+int internal_line_source = 0;
+/* bool for showing the clock; why am I commenting this? */
+bool show_clock = false;
+bool slideshow_enabled = false;
+bool always_show_clock = false;
+bool show_indicator = false;
+float refresh_rate = 1.0;
+
+/* there's some issues with compositing - upstream removed support for this, but we'll allow people to supply an arg to enable it */
+bool composite = false;
+/* time formatter strings for date/time
+    I picked 32-length char arrays because some people might want really funky time formatters.
+    Who am I to judge?
+*/
+/*
+ * 0 = center
+ * 1 = left
+ * 2 = right
+ */
+int verif_align = 0;
+int wrong_align = 0;
+int time_align = 0;
+int date_align = 0;
+int layout_align = 0;
+int modif_align = 0;
+int greeter_align = 0;
+
+char time_format[32] = "%H:%M:%S\0";
+char date_format[32] = "%A, %m %Y\0";
+
+char verif_font[32] = "sans-serif\0";
+char wrong_font[32] = "sans-serif\0";
+char layout_font[32] = "sans-serif\0";
+char time_font[32] = "sans-serif\0";
+char date_font[32] = "sans-serif\0";
+char greeter_font[32] = "sans-serif\0";
+
+char* fonts[6] = {
+    verif_font,
+    wrong_font,
+    layout_font,
+    time_font,
+    date_font,
+    greeter_font
+};
+
+char ind_x_expr[32] = "x + (w / 2)\0";
+char ind_y_expr[32] = "y + (h / 2)\0";
+char time_x_expr[32] = "ix\0";
+char time_y_expr[32] = "iy\0";
+char date_x_expr[32] = "tx\0";
+char date_y_expr[32] = "ty+30\0";
+char layout_x_expr[32] = "dx\0";
+char layout_y_expr[32] = "dy+30\0";
+char status_x_expr[32] = "ix\0";
+char status_y_expr[32] = "iy\0";
+char modif_x_expr[32] = "ix\0";
+char modif_y_expr[32] = "iy+28\0";
+char verif_x_expr[32] = "ix\0";
+char verif_y_expr[32] = "iy\0";
+char wrong_x_expr[32] = "ix\0";
+char wrong_y_expr[32] = "iy\0";
+char greeter_x_expr[32] = "ix\0";
+char greeter_y_expr[32] = "ix\0";
+
+double time_size = 32.0;
+double date_size = 14.0;
+double verif_size = 28.0;
+double wrong_size = 28.0;
+double modifier_size = 14.0;
+double layout_size = 14.0;
+double circle_radius = 90.0;
+double ring_width = 7.0;
+double greeter_size = 32.0;
+
+char* verif_text = "verifying…";
+char* wrong_text = "wrong!";
+char* noinput_text = "no input";
+char* lock_text = "locking…";
+char* lock_failed_text = "lock failed!";
+int   keylayout_mode = -1;
+char* layout_text = NULL;
+char* greeter_text = "";
+
+/* opts for blurring */
+bool blur = false;
+bool step_blur = false;
+int blur_sigma = 5;
+
 uint32_t last_resolution[2];
 xcb_window_t win;
 static xcb_cursor_t cursor;
@@ -87,26 +210,124 @@ bool retry_verification = false;
 static struct xkb_state *xkb_state;
 static struct xkb_context *xkb_context;
 static struct xkb_keymap *xkb_keymap;
+#if XKBCOMPOSE == 1
 static struct xkb_compose_table *xkb_compose_table;
 static struct xkb_compose_state *xkb_compose_state;
+#endif
 static uint8_t xkb_base_event;
 static uint8_t xkb_base_error;
 static int randr_base = -1;
 
 cairo_surface_t *img = NULL;
+cairo_surface_t *blur_img = NULL;
+cairo_surface_t *img_slideshow[256];
+int slideshow_image_count = 0;
+int slideshow_interval = 10;
+bool slideshow_random_selection = false;
+
 bool tile = false;
 bool ignore_empty_password = false;
 bool skip_repeated_empty_password = false;
+bool pass_media_keys = false;
+bool pass_screen_keys = false;
+bool pass_power_keys = false;
+
+// for the rendering thread, so we can clean it up
+pthread_t draw_thread;
+// main thread still sometimes calls redraw()
+// allow you to disable. handy if you use bar with lots of crap.
+bool redraw_thread = false;
+
+#define BAR_VERT 0
+#define BAR_FLAT 1
+#define BAR_DEFAULT 0
+#define BAR_REVERSED 1
+#define BAR_BIDIRECTIONAL 2
+// experimental bar stuff
+bool bar_enabled = false;
+double *bar_heights = NULL;
+double bar_step = 15;
+double bar_base_height = 25;
+double bar_periodic_step = 15;
+double max_bar_height = 25;
+int num_bars = 0;
+int bar_width = 150;
+int bar_orientation = BAR_FLAT;
+
+char bar_base_color[9] = "000000ff";
+char bar_expr[32] = "0\0";
+bool bar_bidirectional = false;
+bool bar_reversed = false;
 
 /* isutf, u8_dec © 2005 Jeff Bezanson, public domain */
 #define isutf(c) (((c)&0xC0) != 0x80)
 
 /*
+ * Checks if the given path leads to an actual file or something else, e.g. a directory
+ */
+int is_directory(const char *path) {
+    struct stat path_stat;
+    stat(path, &path_stat);
+    return S_ISDIR(path_stat.st_mode);
+}
+
+/*
  * Decrements i to point to the previous unicode glyph
  *
  */
-void u8_dec(char *s, int *i) {
+static void u8_dec(char *s, int *i) {
     (void)(isutf(s[--(*i)]) || isutf(s[--(*i)]) || isutf(s[--(*i)]) || --(*i));
+}
+
+/*
+ * fetches the keylayout name
+ *      -1 (do not)
+ * arg: 0 (show full string returned)
+ *      1 (show the text, sans parenthesis)
+ *      2 (show just what's in the parenthesis)
+ *
+ * credit to the XKB/xcb implementation (no libx11) from https://gist.github.com/bluetech/6061368
+ * docs are really sparse, so finding some random implementation was nice
+ */
+static char* get_keylayoutname(int mode, xcb_connection_t* conn) {
+    if (mode < 0 || mode > 2) return NULL;
+    char* newans = NULL, *answer = xcb_get_key_group_names(conn);
+    DEBUG("keylayout answer is: [%s]\n", answer);
+    switch (mode) {
+        case 1:
+            // truncate the string at the first parens
+            for(int i = 0; answer[i] != '\0'; ++i) {
+                if (answer[i] == '(') {
+                    if (i != 0 && answer[i - 1] == ' ') {
+                        answer[i - 1] = '\0';
+                        break;
+                    } else {
+                        answer[i] = '\0';
+                        break;
+                    }
+                }
+            }
+            break;
+        case 2:
+            for(int i = 0; answer[i] != '\0'; ++i) {
+                if (answer[i] == '(') {
+                    newans = &answer[i + 1];
+                } else if (answer[i] == ')' && newans != NULL) {
+                    answer[i] = '\0';
+                    break;
+                }
+            }
+            if (newans != NULL)
+                answer = newans;
+            break;
+        case 0:
+            // fall through
+        default:
+            break;
+    }
+    DEBUG("answer after mode parsing: [%s]\n", answer);
+    // Free symbolic names structures
+    return answer;
 }
 
 /*
@@ -115,6 +336,7 @@ void u8_dec(char *s, int *i) {
  * translate keypresses to utf-8.
  *
  */
+
 static bool load_keymap(void) {
     if (xkb_context == NULL) {
         if ((xkb_context = xkb_context_new(0)) == NULL) {
@@ -145,6 +367,7 @@ static bool load_keymap(void) {
     return true;
 }
 
+#if XKBCOMPOSE == 1
 /*
  * Loads the XKB compose table from the given locale.
  *
@@ -168,6 +391,7 @@ static bool load_compose_table(const char *locale) {
 
     return true;
 }
+#endif /* XKBCOMPOSE */
 
 /*
  * Clears the memory which stored the password to be a bit safer against
@@ -414,7 +638,9 @@ static void handle_key_press(xcb_key_press_event_t *event) {
     char buffer[128];
     int n;
     bool ctrl;
+#if XKBCOMPOSE == 1
     bool composed = false;
+#endif
 
     ksym = xkb_state_key_get_one_sym(xkb_state, event->detail);
     ctrl = xkb_state_mod_name_is_active(xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_DEPRESSED);
@@ -422,6 +648,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
     /* The buffer will be null-terminated, so n >= 2 for 1 actual character. */
     memset(buffer, '\0', sizeof(buffer));
 
+#if XKBCOMPOSE == 1
     if (xkb_compose_state && xkb_compose_state_feed(xkb_compose_state, ksym) == XKB_COMPOSE_FEED_ACCEPTED) {
         switch (xkb_compose_state_get_status(xkb_compose_state)) {
             case XKB_COMPOSE_NOTHING:
@@ -444,7 +671,47 @@ static void handle_key_press(xcb_key_press_event_t *event) {
     if (!composed) {
         n = xkb_keysym_to_utf8(ksym, buffer, sizeof(buffer));
     }
+#else
+    n = xkb_keysym_to_utf8(ksym, buffer, sizeof(buffer));
+#endif
 
+    // media keys
+    if (pass_media_keys) {
+        switch(ksym) {
+            case XKB_KEY_XF86AudioPlay:
+            case XKB_KEY_XF86AudioPause:
+            case XKB_KEY_XF86AudioStop:
+            case XKB_KEY_XF86AudioPrev:
+            case XKB_KEY_XF86AudioNext:
+            case XKB_KEY_XF86AudioMute:
+            case XKB_KEY_XF86AudioLowerVolume:
+            case XKB_KEY_XF86AudioRaiseVolume:
+                xcb_send_event(conn, true, screen->root, XCB_EVENT_MASK_BUTTON_PRESS, (char *)event);
+                return;
+        }
+    }
+
+	// screen keys
+    if (pass_screen_keys) {
+        switch(ksym) {
+            case XKB_KEY_XF86MonBrightnessUp:
+            case XKB_KEY_XF86MonBrightnessDown:
+                xcb_send_event(conn, true, screen->root, XCB_EVENT_MASK_BUTTON_PRESS, (char *)event);
+                return;
+        }
+    }
+
+	// power keys
+    if (pass_power_keys) {
+        switch(ksym) {
+            case XKB_KEY_XF86PowerDown:
+            case XKB_KEY_XF86PowerOff:
+                xcb_send_event(conn, true, screen->root, XCB_EVENT_MASK_BUTTON_PRESS, (char *)event);
+                return;
+        }
+    }
+
+    // return/enter/etc
     switch (ksym) {
         case XKB_KEY_j:
         case XKB_KEY_m:
@@ -476,6 +743,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
             }
     }
 
+    // backspace, esc, delete, etc
     switch (ksym) {
         case XKB_KEY_u:
         case XKB_KEY_Escape:
@@ -817,7 +1085,7 @@ static bool verify_png_image(const char *image_path) {
     /* Check file exists and has correct PNG header */
     FILE *png_file = fopen(image_path, "r");
     if (png_file == NULL) {
-        fprintf(stderr, "Image file path \"%s\" cannot be opened: %s\n", image_path, strerror(errno));
+        DEBUG("Image file path \"%s\" cannot be opened: %s\n", image_path, strerror(errno));
         return false;
     }
     unsigned char png_header[8];
@@ -825,7 +1093,7 @@ static bool verify_png_image(const char *image_path) {
     int bytes_read = fread(png_header, 1, sizeof(png_header), png_file);
     fclose(png_file);
     if (bytes_read != sizeof(png_header)) {
-        fprintf(stderr, "Could not read PNG header from \"%s\"\n", image_path);
+        DEBUG("Could not read PNG header from \"%s\"\n", image_path);
         return false;
     }
 
@@ -833,7 +1101,7 @@ static bool verify_png_image(const char *image_path) {
     // https://www.w3.org/TR/2003/REC-PNG-20031110/#5PNG-file-signature
     static unsigned char PNG_REFERENCE_HEADER[8] = {137, 80, 78, 71, 13, 10, 26, 10};
     if (memcmp(PNG_REFERENCE_HEADER, png_header, sizeof(png_header)) != 0) {
-        fprintf(stderr, "File \"%s\" does not start with a PNG header. i3lock currently only supports loading PNG files.\n", image_path);
+        DEBUG("File \"%s\" does not start with a PNG header. i3lock currently only supports loading PNG files.\n", image_path);
         return false;
     }
     return true;
@@ -1027,6 +1295,78 @@ static void raise_loop(xcb_window_t window) {
     }
 }
 
+/*
+ * Loads an image from the given path. Handles JPEG and PNG. Returns NULL in case of error.
+ */
+static cairo_surface_t* load_image(char* image_path, char* image_raw_format) {
+    cairo_surface_t *img = NULL;
+    JPEG_INFO jpg_info;
+
+    if (image_raw_format != NULL && image_path != NULL) {
+        /* Read image. 'read_raw_image' returns NULL on error,
+         * so we don't have to handle errors here. */
+        img = read_raw_image(image_path, image_raw_format);
+    } else if (verify_png_image(image_path)) {
+        /* Create a pixmap to render on, fill it with the background color */
+        img = cairo_image_surface_create_from_png(image_path);
+    } else if (file_is_jpg(image_path)) {
+        DEBUG("Image looks like a jpeg, decoding\n");
+        unsigned char* jpg_data = read_JPEG_file(image_path, &jpg_info);
+            if (jpg_data != NULL) {
+                img = cairo_image_surface_create_for_data(jpg_data,
+                        CAIRO_FORMAT_ARGB32, jpg_info.width, jpg_info.height,
+                        jpg_info.stride);
+            }
+    }
+
+    /* In case loading failed, we just pretend no -i was specified. */
+    if (img && cairo_surface_status(img) != CAIRO_STATUS_SUCCESS) {
+        fprintf(stderr, "Could not load image \"%s\": %s\n",
+                image_path, cairo_status_to_string(cairo_surface_status(img)));
+        img = NULL;
+    }
+
+    return img;
+}
+
+/*
+ * Loads the images from the provided directory and stores them in the pointer array
+ * img_slideshow
+ */
+static void load_slideshow_images(const char *path, char *image_raw_format) {
+    slideshow_enabled = true;
+    DIR *d;
+    struct dirent *dir;
+    int file_count = 0;
+
+    d = opendir(path);
+    if (d == NULL) {
+        printf("Could not open directory: %s\n", path);
+        exit(0);
+    }
+
+    while ((dir = readdir(d)) != NULL) {
+        if (file_count >= 256) {
+            break;
+        }
+
+        char path_to_image[256];
+        strcpy(path_to_image, path);
+        strcat(path_to_image, "/");
+        strcat(path_to_image, dir->d_name);
+
+        img_slideshow[file_count] = load_image(path_to_image, image_raw_format);
+
+        if (img_slideshow[file_count] != NULL) {
+            ++file_count;
+        }
+    }
+
+    slideshow_image_count = file_count;
+
+    closedir(d);
+}
+
 int main(int argc, char *argv[]) {
     struct passwd *pw;
     char *username;
@@ -1047,15 +1387,119 @@ int main(int argc, char *argv[]) {
         {"dpms", no_argument, NULL, 'd'},
         {"color", required_argument, NULL, 'c'},
         {"pointer", required_argument, NULL, 'p'},
-        {"debug", no_argument, NULL, 0},
+        {"debug", no_argument, NULL, 999},
         {"help", no_argument, NULL, 'h'},
         {"no-unlock-indicator", no_argument, NULL, 'u'},
         {"image", required_argument, NULL, 'i'},
-        {"raw", required_argument, NULL, 0},
+        {"raw", required_argument, NULL, 998},
         {"tiling", no_argument, NULL, 't'},
         {"ignore-empty-password", no_argument, NULL, 'e'},
         {"inactivity-timeout", required_argument, NULL, 'I'},
         {"show-failed-attempts", no_argument, NULL, 'f'},
+
+        // options for unlock indicator colors
+        {"insidevercolor", required_argument, NULL, 300},
+        {"insidewrongcolor", required_argument, NULL, 301},
+        {"insidecolor", required_argument, NULL, 302},
+        {"ringvercolor", required_argument, NULL, 303},
+        {"ringwrongcolor", required_argument, NULL, 304},
+        {"ringcolor", required_argument, NULL, 305},
+        {"linecolor", required_argument, NULL, 306},
+        {"verifcolor", required_argument, NULL, 307},
+        {"wrongcolor", required_argument, NULL, 308},
+        {"layoutcolor", required_argument, NULL, 309},
+        {"timecolor", required_argument, NULL, 310},
+        {"datecolor", required_argument, NULL, 311},
+        {"keyhlcolor", required_argument, NULL, 312},
+        {"bshlcolor", required_argument, NULL, 313},
+        {"separatorcolor", required_argument, NULL, 314},
+        {"greetercolor", required_argument, NULL, 315},
+
+        {"line-uses-ring", no_argument, NULL, 'r'},
+        {"line-uses-inside", no_argument, NULL, 's'},
+
+        {"screen", required_argument, NULL, 'S'},
+        {"blur", required_argument, NULL, 'B'},
+        {"clock", no_argument, NULL, 'k'},
+        {"force-clock", no_argument, NULL, 400},
+        {"indicator", no_argument, NULL, 401},
+        {"radius", required_argument, NULL, 402},
+        {"ring-width", required_argument, NULL, 403},
+
+        // alignment
+        {"time-align", required_argument, NULL, 500},
+        {"date-align", required_argument, NULL, 501},
+        {"verif-align", required_argument, NULL, 502},
+        {"wrong-align", required_argument, NULL, 503},
+        {"layout-align", required_argument, NULL, 504},
+        {"modif-align", required_argument, NULL, 505},
+        {"greeter-align", required_argument, NULL, 506},
+
+        // string stuff
+        {"timestr", required_argument, NULL, 510},
+        {"datestr", required_argument, NULL, 511},
+        {"veriftext", required_argument, NULL, 512},
+        {"wrongtext", required_argument, NULL, 513},
+        {"keylayout", required_argument, NULL, 514},
+        {"noinputtext", required_argument, NULL, 515},
+        {"locktext", required_argument, NULL, 516},
+        {"lockfailedtext", required_argument, NULL, 517},
+        {"greetertext", required_argument, NULL, 518},
+
+        // fonts
+        {"time-font", required_argument, NULL, 520},
+        {"date-font", required_argument, NULL, 521},
+        {"verif-font", required_argument, NULL, 522},
+        {"wrong-font", required_argument, NULL, 523},
+        {"layout-font", required_argument, NULL, 524},
+        {"greeter-font", required_argument, NULL, 525},
+
+        // text size
+        {"timesize", required_argument, NULL, 530},
+        {"datesize", required_argument, NULL, 531},
+        {"verifsize", required_argument, NULL, 532},
+        {"wrongsize", required_argument, NULL, 533},
+        {"layoutsize", required_argument, NULL, 534},
+        {"modsize", required_argument, NULL, 535},
+        {"greetersize", required_argument, NULL, 536},
+
+        // text/indicator positioning
+        {"timepos", required_argument, NULL, 540},
+        {"datepos", required_argument, NULL, 541},
+        {"verifpos", required_argument, NULL, 542},
+        {"wrongpos", required_argument, NULL, 543},
+        {"layoutpos", required_argument, NULL, 544},
+        {"statuspos", required_argument, NULL, 545},
+        {"modifpos", required_argument, NULL, 546},
+        {"indpos", required_argument, NULL, 547},
+        {"greeterpos", required_argument, NULL, 548},
+
+		// pass keys
+        {"pass-media-keys", no_argument, NULL, 601},
+        {"pass-screen-keys", no_argument, NULL, 602},
+        {"pass-power-keys", no_argument, NULL, 603},
+
+        // bar indicator stuff
+        {"bar-indicator", no_argument, NULL, 700},
+        {"bar-direction", required_argument, NULL, 701},
+        {"bar-width", required_argument, NULL, 702},
+        {"bar-orientation", required_argument, NULL, 703},
+        {"bar-step", required_argument, NULL, 704},
+        {"bar-max-height", required_argument, NULL, 705},
+        {"bar-base-width", required_argument, NULL, 706},
+        {"bar-color", required_argument, NULL, 707},
+        {"bar-periodic-step", required_argument, NULL, 708},
+        {"bar-position", required_argument, NULL, 709},
+
+        // misc.
+        {"redraw-thread", no_argument, NULL, 900},
+        {"refresh-rate", required_argument, NULL, 901},
+        {"composite", no_argument, NULL, 902},
+
+        // slideshow options
+        {"slideshow-interval", required_argument, NULL, 903},
+        {"slideshow-random-selection", no_argument, NULL, 904},
+
         {NULL, no_argument, NULL, 0}};
 
     if ((pw = getpwuid(getuid())) == NULL)
@@ -1063,11 +1507,13 @@ int main(int argc, char *argv[]) {
     if ((username = pw->pw_name) == NULL)
         errx(EXIT_FAILURE, "pw->pw_name is NULL.");
 
-    char *optstring = "hvnbdc:p:ui:teI:f";
+    char *optstring = "hvnbdc:p:ui:teI:frsS:kB:m";
+    char *arg = NULL;
+    int opt = 0;
     while ((o = getopt_long(argc, argv, optstring, longopts, &longoptind)) != -1) {
         switch (o) {
             case 'v':
-                errx(EXIT_SUCCESS, "version " I3LOCK_VERSION " © 2010 Michael Stapelberg");
+                errx(EXIT_SUCCESS, "version " I3LOCK_VERSION " © 2010 Michael Stapelberg, © 2015 Cassandra Fox");
             case 'n':
                 dont_fork = true;
                 break;
@@ -1082,7 +1528,7 @@ int main(int argc, char *argv[]) {
                 break;
             }
             case 'c': {
-                char *arg = optarg;
+                arg = optarg;
 
                 /* Skip # if present */
                 if (arg[0] == '#')
@@ -1114,18 +1560,491 @@ int main(int argc, char *argv[]) {
             case 'e':
                 ignore_empty_password = true;
                 break;
-            case 0:
-                if (strcmp(longopts[longoptind].name, "debug") == 0)
-                    debug_mode = true;
-                else if (strcmp(longopts[longoptind].name, "raw") == 0)
-                    image_raw_format = strdup(optarg);
-                break;
             case 'f':
                 show_failed_attempts = true;
                 break;
+            case 'r':
+                if (internal_line_source != 0) {
+                  errx(EXIT_FAILURE, "i3lock-color: Options line-uses-ring and line-uses-inside conflict.");
+                }
+                internal_line_source = 1; //sets the line drawn inside to use the inside color when drawn
+                break;
+            case 's':
+                if (internal_line_source != 0) {
+                  errx(EXIT_FAILURE, "i3lock-color: Options line-uses-ring and line-uses-inside conflict.");
+                }
+                internal_line_source = 2;
+                break;
+            case 'S':
+                screen_number = atoi(optarg);
+                break;
+
+            case 'k':
+                show_clock = true;
+                break;
+            case 'B':
+                blur = true;
+                blur_sigma = atoi(optarg);
+                break;
+
+            // Begin colors
+			#define parse_color(color)\
+                arg = optarg;\
+                if (arg[0] == '#') arg++;\
+                if (strlen(arg) != 8 || sscanf(arg, "%08[0-9a-fA-F]", color) != 1)\
+                    errx(1, #color " is invalid, color must be given in 4-byte format: rrggbbaa\n");
+            case 300:
+                parse_color(insidevercolor);
+                break;
+            case 301:
+                parse_color(insidewrongcolor);
+                break;
+            case 302:
+                parse_color(insidecolor);
+                break;
+            case 303:
+                parse_color(ringvercolor);
+                break;
+            case 304:
+                parse_color(ringwrongcolor);
+                break;
+            case 305:
+                parse_color(ringcolor);
+                break;
+            case 306:
+                parse_color(linecolor);
+                break;
+            case 307:
+                parse_color(verifcolor);
+                break;
+            case 308:
+                parse_color(wrongcolor);
+                break;
+            case 309:
+                parse_color(layoutcolor);
+                break;
+            case 310:
+                parse_color(timecolor);
+                break;
+            case 311:
+                parse_color(datecolor);
+                break;
+            case 312:
+                parse_color(keyhlcolor);
+                break;
+            case 313:
+                parse_color(bshlcolor);
+                break;
+            case 314:
+                parse_color(separatorcolor);
+                break;
+            case 315:
+                parse_color(greetercolor);
+                break;
+
+			// General indicator opts
+            case 400:
+                show_clock = true;
+                always_show_clock = true;
+                break;
+            case 401:
+                show_indicator = true;
+                break;
+            case 402:
+                arg = optarg;
+                if (sscanf(arg, "%lf", &circle_radius) != 1)
+                    errx(1, "radius must be a number\n");
+                if (circle_radius < 1) {
+                    fprintf(stderr, "radius must be a positive integer; ignoring...\n");
+                    circle_radius = 90.0;
+                }
+                break;
+            case 403:
+                arg = optarg;
+                if (sscanf(arg, "%lf", &ring_width) != 1)
+                    errx(1, "ring-width must be a number\n");
+                if (ring_width < 1.0) {
+                    fprintf(stderr, "ring-width must be a positive float; ignoring...\n");
+                    ring_width = 7.0;
+                }
+                break;
+
+			// Alignment stuff
+            case 500:
+                opt = atoi(optarg);
+                if (opt < 0 || opt > 2) opt = 0;
+                time_align = opt;
+                break;
+            case 501:
+                opt = atoi(optarg);
+                if (opt < 0 || opt > 2) opt = 0;
+                date_align = opt;
+                break;
+            case 502:
+                opt = atoi(optarg);
+                if (opt < 0 || opt > 2) opt = 0;
+                verif_align = opt;
+                break;
+            case 503:
+                opt = atoi(optarg);
+                if (opt < 0 || opt > 2) opt = 0;
+                wrong_align = opt;
+                break;
+            case 504:
+                opt = atoi(optarg);
+                if (opt < 0 || opt > 2) opt = 0;
+                layout_align = opt;
+                break;
+            case 505:
+                opt = atoi(optarg);
+                if (opt < 0 || opt > 2) opt = 0;
+                modif_align = opt;
+                break;
+            case 506:
+                opt = atoi(optarg);
+                if (opt < 0 || opt > 2) opt = 0;
+                greeter_align = opt;
+                break;
+
+			// String stuff
+            case 510:
+                if (strlen(optarg) > 31) {
+                    errx(1, "time format string can be at most 31 characters\n");
+                }
+                strcpy(time_format,optarg);
+                break;
+            case 511:
+                if (strlen(optarg) > 31) {
+                    errx(1, "time format string can be at most 31 characters\n");
+                }
+                strcpy(date_format,optarg);
+                break;
+            case 512:
+                verif_text = optarg;
+                break;
+            case 513:
+                wrong_text = optarg;
+                break;
+            case 514:
+                // if layout is NULL, do nothing
+                // if not NULL, attempt to display stuff
+                // need to code some sane defaults for it
+                keylayout_mode = atoi(optarg);
+                break;
+            case 515:
+                noinput_text = optarg;
+                break;
+            case 516:
+                lock_text = optarg;
+                break;
+            case 517:
+                lock_failed_text = optarg;
+                break;
+            case 518:
+                greeter_text = optarg;
+                break;
+
+			// Font stuff
+            case 520:
+                if (strlen(optarg) > 31) {
+                    errx(1, "time font string can be at most 31 characters\n");
+                }
+                strcpy(fonts[TIME_FONT],optarg);
+                break;
+            case 521:
+                if (strlen(optarg) > 31) {
+                    errx(1, "date font string can be at most 31 characters\n");
+                }
+                strcpy(fonts[DATE_FONT],optarg);
+                break;
+            case 522:
+                if (strlen(optarg) > 31) {
+                    errx(1, "verif font string can be at most 31 "
+                            "characters\n");
+                }
+                strcpy(fonts[VERIF_FONT],optarg);
+                break;
+            case 523:
+                if (strlen(optarg) > 31) {
+                    errx(1, "wrong font string can be at most 31 "
+                            "characters\n");
+                }
+                strcpy(fonts[WRONG_FONT],optarg);
+                break;
+            case 524:
+                if (strlen(optarg) > 31) {
+                    errx(1, "layout font string can be at most 31 characters\n");
+                }
+                strcpy(fonts[LAYOUT_FONT],optarg);
+                break;
+            case 525:
+                if (strlen(optarg) > 31) {
+                    errx(1, "greeter font string can be at most 31 characters\n");
+                }
+                strcpy(fonts[GREETER_FONT],optarg);
+                break;
+
+			// Text size
+            case 530:
+                arg = optarg;
+                if (sscanf(arg, "%lf", &time_size) != 1)
+                    errx(1, "timesize must be a number\n");
+                if (time_size < 1)
+                    errx(1, "timesize must be larger than 0\n");
+                break;
+            case 531:
+                arg = optarg;
+                if (sscanf(arg, "%lf", &date_size) != 1)
+                    errx(1, "datesize must be a number\n");
+                if (date_size < 1)
+                    errx(1, "datesize must be larger than 0\n");
+                break;
+            case 532:
+                arg = optarg;
+                if (sscanf(arg, "%lf", &verif_size) != 1)
+                    errx(1, "verifsize must be a number\n");
+                if (verif_size < 1) {
+                    fprintf(stderr, "verifsize must be a positive integer; ignoring...\n");
+                    verif_size = 28.0;
+                }
+                break;
+            case 533:
+                arg = optarg;
+                if (sscanf(arg, "%lf", &wrong_size) != 1)
+                    errx(1, "wrongsize must be a number\n");
+                if (wrong_size < 1) {
+                    fprintf(stderr, "wrongsize must be a positive integer; ignoring...\n");
+                    wrong_size = 28.0;
+                }
+                break;
+            case 534:
+                arg = optarg;
+                if (sscanf(arg, "%lf", &layout_size) != 1)
+                    errx(1, "layoutsize must be a number\n");
+                if (date_size < 1)
+                    errx(1, "layoutsize must be larger than 0\n");
+                break;
+            case 535:
+                arg = optarg;
+                if (sscanf(arg, "%lf", &modifier_size) != 1)
+                    errx(1, "modsize must be a number\n");
+                if (modifier_size < 1) {
+                    fprintf(stderr, "modsize must be a positive integer; ignoring...\n");
+                    modifier_size = 14.0;
+                }
+                break;
+            case 536:
+                arg = optarg;
+                if (sscanf(arg, "%lf", &greeter_size) != 1)
+                    errx(1, "greetersize must be a number\n");
+                if (greeter_size < 1) {
+                    fprintf(stderr, "greetersize must be a positive integer; ignoring...\n");
+                    greeter_size = 14.0;
+                }
+                break;
+
+			// Positions
+            case 540:
+                //read in to time_x_expr and time_y_expr
+                if (strlen(optarg) > 31) {
+                    // this is overly restrictive since both the x and y string buffers have size 32, but it's easier to check.
+                    errx(1, "time position string can be at most 31 characters\n");
+                }
+                arg = optarg;
+                if (sscanf(arg, "%30[^:]:%30[^:]", time_x_expr, time_y_expr) != 2) {
+                    errx(1, "timepos must be of the form x:y\n");
+                }
+                break;
+            case 541:
+                //read in to date_x_expr and date_y_expr
+                if (strlen(optarg) > 31) {
+                    // this is overly restrictive since both the x and y string buffers have size 32, but it's easier to check.
+                    errx(1, "date position string can be at most 31 characters\n");
+                }
+                arg = optarg;
+                if (sscanf(arg, "%30[^:]:%30[^:]", date_x_expr, date_y_expr) != 2) {
+                    errx(1, "datepos must be of the form x:y\n");
+                }
+                break;
+            case 542:
+                // read in to time_x_expr and time_y_expr
+                if (strlen(optarg) > 31) {
+                    errx(1, "verif position string can be at most 31 characters\n");
+                }
+                arg = optarg;
+                if (sscanf(arg, "%30[^:]:%30[^:]", verif_x_expr, verif_y_expr) != 2) {
+                    errx(1, "verifpos must be of the form x:y\n");
+                }
+                break;
+            case 543:
+                if (strlen(optarg) > 31) {
+                    errx(1, "\"wrong\" text position string can be at most 31 characters\n");
+                }
+                arg = optarg;
+                if (sscanf(arg, "%30[^:]:%30[^:]", wrong_x_expr, wrong_y_expr) != 2) {
+                    errx(1, "verifpos must be of the form x:y\n");
+                }
+                break;
+            case 544:
+                if (strlen(optarg) > 31) {
+                    errx(1, "layout position string can be at most 31 characters\n");
+                }
+                arg = optarg;
+                if (sscanf(arg, "%30[^:]:%30[^:]", layout_x_expr, layout_y_expr) != 2) {
+                    errx(1, "layoutpos must be of the form x:y\n");
+                }
+                break;
+            case 545:
+                if (strlen(optarg) > 31) {
+                    // this is overly restrictive since both the x and y string buffers have size 32, but it's easier to check.
+                    errx(1, "status position string can be at most 31 characters\n");
+                }
+                arg = optarg;
+                if (sscanf(arg, "%30[^:]:%30[^:]", status_x_expr, status_y_expr) != 2) {
+                    errx(1, "statuspos must be of the form x:y\n");
+                }
+                break;
+            case 546:
+                if (strlen(optarg) > 31) {
+                    // this is overly restrictive since both the x and y string buffers have size 32, but it's easier to check.
+                    errx(1, "modif position string can be at most 31 characters\n");
+                }
+                arg = optarg;
+                if (sscanf(arg, "%30[^:]:%30[^:]", modif_x_expr, modif_y_expr) != 2) {
+                    errx(1, "modifpos must be of the form x:y\n");
+                }
+                break;
+            case 547:
+                if (strlen(optarg) > 31) {
+                    // this is overly restrictive since both the x and y string buffers have size 32, but it's easier to check.
+                    errx(1, "indicator position string can be at most 31 characters\n");
+                }
+                arg = optarg;
+                if (sscanf(arg, "%30[^:]:%30[^:]", ind_x_expr, ind_y_expr) != 2) {
+                    errx(1, "indpos must be of the form x:y\n");
+                }
+                break;
+            case 548:
+                if (strlen(optarg) > 31) {
+                    // this is overly restrictive since both the x and y string buffers have size 32, but it's easier to check.
+                    errx(1, "indicator position string can be at most 31 characters\n");
+                }
+                arg = optarg;
+                if (sscanf(arg, "%30[^:]:%30[^:]", greeter_x_expr, greeter_y_expr) != 2) {
+                    errx(1, "indpos must be of the form x:y\n");
+                }
+                break;
+
+			// Pass keys
+			case 601:
+				pass_media_keys = true;
+				break;
+			case 602:
+				pass_screen_keys = true;
+				break;
+			case 603:
+				pass_power_keys = true;
+				break;
+
+			// Bar indicator
+            case 700:
+                bar_enabled = true;
+                break;
+            case 701:
+                opt = atoi(optarg);
+                switch(opt) {
+                    case BAR_REVERSED:
+                        bar_reversed = true;
+                        break;
+                    case BAR_BIDIRECTIONAL:
+                        bar_bidirectional = true;
+                        break;
+                    case BAR_DEFAULT:
+                    default:
+                        break;
+                }
+                break;
+            case 702:
+                bar_width = atoi(optarg);
+                if (bar_width < 1) bar_width = 150;
+                // num_bars and bar_heights* initialized later when we grab display info
+                break;
+            case 703:
+                arg = optarg;
+                if (strcmp(arg, "vertical") == 0)
+                    bar_orientation = BAR_VERT;
+                else if (strcmp(arg, "horizontal") == 0)
+                    bar_orientation = BAR_FLAT;
+                else
+                    errx(1, "bar orientation must be \"vertical\" or \"horizontal\"\n");
+                break;
+            case 704:
+                bar_step = atoi(optarg);
+                if (bar_step < 1) bar_step = 15;
+                break;
+            case 705:
+                max_bar_height = atoi(optarg);
+                if (max_bar_height < 1) max_bar_height = 25;
+                break;
+            case 706:
+                bar_base_height = atoi(optarg);
+                if (bar_base_height < 1) bar_base_height = 25;
+                break;
+            case 707:
+                parse_color(bar_base_color);
+                break;
+            case 708:
+                opt = atoi(optarg);
+                if (opt > 0)
+                    bar_periodic_step = opt;
+                break;
+            case 709:
+                //read in to ind_x_expr and ind_y_expr
+                if (strlen(optarg) > 31) {
+                    // this is overly restrictive since both the x and y string buffers have size 32, but it's easier to check.
+                    errx(1, "indicator position string can be at most 31 characters\n");
+                }
+                arg = optarg;
+                if (sscanf(arg, "%31s", bar_expr) != 1) {
+                    errx(1, "bar-position must be of the form [pos] with a max length of 31\n");
+                }
+                break;
+
+			// Misc
+            case 900:
+                redraw_thread = true;
+                break;
+            case 901:
+                arg = optarg;
+                refresh_rate = strtof(arg, NULL);
+                if (refresh_rate < 0.0) {
+                    fprintf(stderr, "The given refresh rate of %fs is less than zero seconds and was ignored.\n", refresh_rate);
+                    refresh_rate = 1.0;
+                }
+                break;
+            case 902:
+                composite = true;
+                break;
+            case 903:
+                slideshow_interval = atoi(optarg);
+
+                if (slideshow_interval < 0) {
+                    slideshow_interval = 10;
+                }
+                break;
+            case 904:
+                slideshow_random_selection = true;
+                break;
+            case 998:
+                image_raw_format = strdup(optarg);
+                break;
+            case 999:
+                debug_mode = true;
+                break;
             default:
                 errx(EXIT_FAILURE, "Syntax: i3lock [-v] [-n] [-b] [-d] [-c color] [-u] [-p win|default]"
-                                   " [-i image.png] [-t] [-e] [-I timeout] [-f]");
+                                   " [-i image.png] [-t] [-e] [-f]\n"
+                                   "Please see the manpage for a full list of arguments.");
         }
     }
 
@@ -1165,7 +2084,9 @@ int main(int argc, char *argv[]) {
     int screennr;
     if ((conn = xcb_connect(NULL, &screennr)) == NULL ||
         xcb_connection_has_error(conn))
-        errx(EXIT_FAILURE, "Could not connect to X11, maybe you need to set DISPLAY?");
+            errx(EXIT_FAILURE, "Could not connect to X11, maybe you need to set DISPLAY?");
+
+
 
     if (xkb_x11_setup_xkb_extension(conn,
                                     XKB_X11_MIN_MAJOR_XKB_VERSION,
@@ -1177,6 +2098,9 @@ int main(int argc, char *argv[]) {
                                     &xkb_base_error) != 1)
         errx(EXIT_FAILURE, "Could not setup XKB extension.");
 
+    layout_text = get_keylayoutname(keylayout_mode, conn);
+    if (layout_text)
+        show_clock = true;
     static const xcb_xkb_map_part_t required_map_parts =
         (XCB_XKB_MAP_PART_KEY_TYPES |
          XCB_XKB_MAP_PART_KEY_SYMS |
@@ -1205,7 +2129,10 @@ int main(int argc, char *argv[]) {
     if (!load_keymap())
         errx(EXIT_FAILURE, "Could not load keymap");
 
+
     const char *locale = getenv("LC_ALL");
+    if (!locale || !*locale)
+        locale = getenv("LC_TIME");
     if (!locale || !*locale)
         locale = getenv("LC_CTYPE");
     if (!locale || !*locale)
@@ -1216,7 +2143,12 @@ int main(int argc, char *argv[]) {
         locale = "C";
     }
 
+    setlocale(LC_ALL, locale);
+
+#if XKBCOMPOSE == 1
     load_compose_table(locale);
+#endif
+
 
     screen = xcb_setup_roots_iterator(xcb_get_setup(conn)).data;
 
@@ -1228,26 +2160,67 @@ int main(int argc, char *argv[]) {
     last_resolution[0] = screen->width_in_pixels;
     last_resolution[1] = screen->height_in_pixels;
 
+    if (bar_enabled && bar_width > 0) {
+        int tmp = screen->width_in_pixels;
+        if (bar_orientation == BAR_VERT) tmp = screen->height_in_pixels;
+        num_bars = tmp / bar_width;
+        if (tmp % bar_width != 0) ++num_bars;
+
+        bar_heights = (double*) calloc(num_bars, sizeof(double));
+    }
+
     xcb_change_window_attributes(conn, screen->root, XCB_CW_EVENT_MASK,
                                  (uint32_t[]){XCB_EVENT_MASK_STRUCTURE_NOTIFY});
 
-    if (image_raw_format != NULL && image_path != NULL) {
-        /* Read image. 'read_raw_image' returns NULL on error,
-         * so we don't have to handle errors here. */
-        img = read_raw_image(image_path, image_raw_format);
-    } else if (verify_png_image(image_path)) {
-        /* Create a pixmap to render on, fill it with the background color */
-        img = cairo_image_surface_create_from_png(image_path);
-        /* In case loading failed, we just pretend no -i was specified. */
-        if (cairo_surface_status(img) != CAIRO_STATUS_SUCCESS) {
-            fprintf(stderr, "Could not load image \"%s\": %s\n",
-                    image_path, cairo_status_to_string(cairo_surface_status(img)));
-            img = NULL;
+    init_colors_once();
+    if (image_path != NULL) {
+        if (!is_directory(image_path)) {
+            img = load_image(image_path, image_raw_format);
+        } else {
+            /* Path to a directory is provided -> use slideshow mode */
+            load_slideshow_images(image_path, image_raw_format);
         }
+
+        free(image_path);
     }
 
-    free(image_path);
     free(image_raw_format);
+
+    xcb_pixmap_t* blur_pixmap = NULL;
+    if (blur) {
+        blur_pixmap = malloc(sizeof(xcb_pixmap_t));
+        xcb_visualtype_t *vistype = get_root_visual_type(screen);
+        *blur_pixmap = capture_bg_pixmap(conn, screen, last_resolution);
+        cairo_surface_t *xcb_img = cairo_xcb_surface_create(conn, *blur_pixmap, vistype, last_resolution[0], last_resolution[1]);
+
+        blur_img = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, last_resolution[0], last_resolution[1]);
+        cairo_t *ctx = cairo_create(blur_img);
+        cairo_set_source_surface(ctx, xcb_img, 0, 0);
+        cairo_paint(ctx);
+
+        blur_image_surface(blur_img, blur_sigma);
+        if (img) {
+            if (!tile) {
+                cairo_set_source_surface(ctx, img, 0, 0);
+                cairo_paint(ctx);
+            } else {
+                /* create a pattern and fill a rectangle as big as the screen */
+                cairo_pattern_t *pattern;
+                pattern = cairo_pattern_create_for_surface(img);
+                cairo_set_source(ctx, pattern);
+                cairo_pattern_set_extend(pattern, CAIRO_EXTEND_REPEAT);
+                cairo_rectangle(ctx, 0, 0, last_resolution[0], last_resolution[1]);
+                cairo_fill(ctx);
+                cairo_pattern_destroy(pattern);
+            }
+            cairo_set_source_surface(ctx, img, 0, 0);
+            cairo_paint(ctx);
+            cairo_surface_destroy(img);
+            img = NULL;
+        }
+        cairo_destroy(ctx);
+        cairo_surface_destroy(xcb_img);
+    }
 
     /* Pixmap on which the image is rendered to (if any) */
     xcb_pixmap_t bg_pixmap = draw_image(last_resolution);
@@ -1257,6 +2230,12 @@ int main(int argc, char *argv[]) {
     /* Open the fullscreen window, already with the correct pixmap in place */
     win = open_fullscreen_window(conn, screen, color, bg_pixmap);
     xcb_free_pixmap(conn, bg_pixmap);
+    if (blur_pixmap) {
+        xcb_free_pixmap(conn, *blur_pixmap);
+        free(blur_pixmap);
+        blur_pixmap = NULL;
+    }
+
 
     cursor = create_cursor(conn, screen, win, curs_choice);
 
@@ -1324,6 +2303,19 @@ int main(int argc, char *argv[]) {
      * received up until now. ev will only pick up new events (when the X11
      * file descriptor becomes readable). */
     ev_invoke(main_loop, xcb_check, 0);
+
+    if (show_clock || bar_enabled || slideshow_enabled) {
+        if (redraw_thread) {
+            struct timespec ts;
+            double s;
+            double ns = modf(refresh_rate, &s);
+            ts.tv_sec = (time_t) s;
+            ts.tv_nsec = ns * NANOSECONDS_IN_SECOND;
+            (void) pthread_create(&draw_thread, NULL, start_time_redraw_tick_pthread, (void*) &ts);
+        } else {
+            start_time_redraw_tick(main_loop);
+        }
+    }
     ev_loop(main_loop, 0);
 
     if (stolen_focus == XCB_NONE) {

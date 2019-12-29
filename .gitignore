@@ -1,7 +1,8 @@
-/i3lock
+i3lock
 *.o
 tags
 *.swp
+*.gz
 
 ################################################################################
 # https://raw.githubusercontent.com/github/gitignore/master/Autotools.gitignore
